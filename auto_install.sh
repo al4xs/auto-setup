@@ -48,7 +48,7 @@ fi
 # Tornar o Zsh o shell padrão
 if [ "$SHELL" != "$(which zsh)" ]; then
     echo "🔧 Tornando o Zsh o shell padrão..."
-    chsh -s $(which zsh)
+    sudo chsh -s $(which zsh) $USER
     echo "✅ Shell padrão alterado para Zsh (reinicie o terminal)."
 else
     echo "✅ Zsh já é o shell padrão."
