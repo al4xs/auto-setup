@@ -87,6 +87,94 @@ command_exists() {
     command -v "$1" >/dev/null 2>&1
 }
 
+# Função para instalar Node.js e npm
+install_nodejs() {
+    log_process "Verificando instalação do Node.js..."
+    
+    # Verificar se Node.js já está instalado com versão adequada
+    if command_exists node; then
+        NODE_VERSION=$(node --version | cut -d'v' -f2 | cut -d'.' -f1)
+        if [ "$NODE_VERSION" -ge 18 ]; then
+            log_success "Node.js já está instalado (versão $(node --version))"
+            return 0
+        else
+            log_warning "Node.js versão antiga detectada. Atualizando..."
+        fi
+    fi
+    
+    log_process "Instalando Node.js LTS mais recente..."
+    
+    # Remover versões antigas do Node.js se existirem
+    sudo apt remove --purge nodejs npm -y || true
+    sudo apt autoremove -y || true
+    
+    # Instalar Node.js via NodeSource (método oficial recomendado)
+    log_process "Baixando script de instalação do NodeSource..."
+    curl -fsSL https://deb.nodesource.com/setup_lts.x | sudo -E bash -
+    
+    log_process "Instalando Node.js e npm..."
+    sudo apt-get install -y nodejs
+    
+    # Verificar se a instalação foi bem-sucedida
+    if command_exists node && command_exists npm; then
+        log_success "Node.js $(node --version) e npm $(npm --version) instalados com sucesso"
+    else
+        log_error "Falha na instalação do Node.js/npm"
+        return 1
+    fi
+    
+    # Configurar npm para instalações globais no diretório do usuário
+    log_process "Configurando npm para instalações globais..."
+    
+    # Criar diretório para pacotes globais npm
+    mkdir -p "$HOME/.npm-global"
+    
+    # Configurar npm para usar o diretório local
+    npm config set prefix "$HOME/.npm-global"
+    
+    # Adicionar ao PATH nos arquivos de configuração do shell
+    configure_nodejs_path
+    
+    # Atualizar npm para a versão mais recente
+    log_process "Atualizando npm para a versão mais recente..."
+    npm install -g npm@latest
+    
+    log_success "Node.js e npm configurados e prontos para uso!"
+}
+
+# Função para configurar PATH do Node.js
+configure_nodejs_path() {
+    log_process "Configurando PATH para Node.js e npm..."
+    
+    # Definir linha do PATH
+    NPM_PATH_LINE='export PATH="$HOME/.npm-global/bin:$PATH"'
+    
+    # Configurar para bash
+    if [ -f "$HOME/.bashrc" ]; then
+        if ! grep -q ".npm-global/bin" "$HOME/.bashrc"; then
+            echo "" >> "$HOME/.bashrc"
+            echo "# Node.js npm global path" >> "$HOME/.bashrc"
+            echo "$NPM_PATH_LINE" >> "$HOME/.bashrc"
+            log_success "PATH configurado no .bashrc"
+        fi
+    fi
+    
+    # Configurar para zsh
+    if [ -f "$HOME/.zshrc" ]; then
+        if ! grep -q ".npm-global/bin" "$HOME/.zshrc"; then
+            echo "" >> "$HOME/.zshrc"
+            echo "# Node.js npm global path" >> "$HOME/.zshrc"
+            echo "$NPM_PATH_LINE" >> "$HOME/.zshrc"
+            log_success "PATH configurado no .zshrc"
+        fi
+    fi
+    
+    # Configurar para o ambiente atual
+    export PATH="$HOME/.npm-global/bin:$PATH"
+    
+    log_success "PATH do Node.js configurado para funcionar de qualquer lugar"
+}
+
 # Função principal de instalação
 main_installation() {
     log_process "Iniciando configuração do ambiente de desenvolvimento..."
@@ -174,12 +262,7 @@ configure_neovim() {
     fi
 
     # Instalar dependências do Neovim (Node.js para alguns plugins)
-    if ! command_exists node; then
-        log_process "Instalando Node.js para plugins do Neovim..."
-        curl -fsSL https://deb.nodesource.com/setup_lts.x | sudo -E bash -
-        sudo apt-get install -y nodejs
-        log_success "Node.js instalado"
-    fi
+    install_nodejs
 
     # Instalar Python provider para Neovim
     if command_exists python3; then
@@ -377,6 +460,13 @@ display_summary() {
         echo -e "   ${GREEN}✅ Node.js: $(node --version)${NC}"
     else
         echo -e "   ${YELLOW}⚠️  Node.js: Não instalado${NC}"
+    fi
+    
+    # Verificar npm
+    if command_exists npm; then
+        echo -e "   ${GREEN}✅ npm: $(npm --version)${NC}"
+    else
+        echo -e "   ${YELLOW}⚠️  npm: Não instalado${NC}"
     fi
     
     echo ""
