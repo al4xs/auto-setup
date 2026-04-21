@@ -23,15 +23,10 @@ detect_system() {
         WSL=false
     fi
 
-    if [ -f /etc/os-release ]; then
-        . /etc/os-release
-        DISTRO=$ID
-        VERSION=$VERSION_ID
-        ok "Sistema: $DISTRO $VERSION"
-    else
-        err "Sistema não identificado"
-        exit 1
-    fi
+    . /etc/os-release
+    DISTRO=$ID
+    VERSION=$VERSION_ID
+    ok "Sistema: $DISTRO $VERSION"
 }
 
 # ===== DEPENDÊNCIAS =====
@@ -39,7 +34,6 @@ install_deps() {
     log "Instalando dependências básicas..."
 
     sudo apt update -y
-
     sudo apt install -y \
         curl wget git unzip build-essential \
         ca-certificates gnupg lsb-release \
@@ -73,17 +67,54 @@ install_zsh() {
         RUNZSH=no sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)"
     fi
 
-    # NÃO força chsh no WSL (evita bug)
+    install_zsh_plugins
+    configure_zsh_plugins
+
     if [ "$WSL" = false ]; then
         chsh -s "$(which zsh)" || warn "Não foi possível alterar shell automaticamente"
     fi
 
-    # fallback seguro
     if ! grep -q "exec zsh" ~/.bashrc; then
-        echo "command -v zsh >/dev/null && exec zsh" >> ~/.bashrc
+        echo 'command -v zsh >/dev/null && exec zsh' >> ~/.bashrc
     fi
 
     ok "Zsh configurado"
+}
+
+# ===== PLUGINS ZSH =====
+install_zsh_plugins() {
+    ZSH_CUSTOM="$HOME/.oh-my-zsh/custom/plugins"
+
+    if [ ! -d "$ZSH_CUSTOM/zsh-autosuggestions" ]; then
+        log "Instalando zsh-autosuggestions..."
+        git clone https://github.com/zsh-users/zsh-autosuggestions $ZSH_CUSTOM/zsh-autosuggestions
+    fi
+
+    if [ ! -d "$ZSH_CUSTOM/zsh-syntax-highlighting" ]; then
+        log "Instalando zsh-syntax-highlighting..."
+        git clone https://github.com/zsh-users/zsh-syntax-highlighting $ZSH_CUSTOM/zsh-syntax-highlighting
+    fi
+}
+
+configure_zsh_plugins() {
+    log "Configurando plugins no .zshrc..."
+
+    if [ ! -f ~/.zshrc ]; then
+        touch ~/.zshrc
+    fi
+
+    # remove linha antiga de plugins
+    sed -i '/^plugins=/d' ~/.zshrc
+
+    # adiciona plugins corretos (ordem importante)
+    echo 'plugins=(git zsh-autosuggestions zsh-syntax-highlighting)' >> ~/.zshrc
+
+    # highlight mais bonito
+    if ! grep -q "ZSH_AUTOSUGGEST_HIGHLIGHT_STYLE" ~/.zshrc; then
+        echo "ZSH_AUTOSUGGEST_HIGHLIGHT_STYLE='fg=8'" >> ~/.zshrc
+    fi
+
+    ok "Plugins configurados corretamente"
 }
 
 # ===== PYENV =====
@@ -134,12 +165,12 @@ install_nvim() {
         git clone https://github.com/al4xs/neovim-config ~/.config/nvim
     fi
 
-    pip install --user pynvim || true
+    python3 -m pip install --user pynvim || true
 
     ok "Neovim configurado"
 }
 
-# ===== FINAL =====
+# ===== MAIN =====
 main() {
     detect_system
     install_deps
