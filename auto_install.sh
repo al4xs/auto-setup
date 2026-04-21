@@ -103,13 +103,9 @@ configure_zsh_plugins() {
         touch ~/.zshrc
     fi
 
-    # remove linha antiga de plugins
     sed -i '/^plugins=/d' ~/.zshrc
-
-    # adiciona plugins corretos (ordem importante)
     echo 'plugins=(git zsh-autosuggestions zsh-syntax-highlighting)' >> ~/.zshrc
 
-    # highlight mais bonito
     if ! grep -q "ZSH_AUTOSUGGEST_HIGHLIGHT_STYLE" ~/.zshrc; then
         echo "ZSH_AUTOSUGGEST_HIGHLIGHT_STYLE='fg=8'" >> ~/.zshrc
     fi
@@ -139,16 +135,40 @@ EOF
 
 # ===== PYTHON 3.10 =====
 install_python310() {
-    if command -v pyenv >/dev/null; then
-        eval "$(pyenv init -)"
+    log "Verificando Python 3.10..."
 
-        if ! pyenv versions | grep -q "3.10"; then
-            log "Instalando Python 3.10..."
-            pyenv install 3.10.13
-        fi
+    export PYENV_ROOT="$HOME/.pyenv"
+    export PATH="$PYENV_ROOT/bin:$PATH"
 
-        pyenv global 3.10.13
-        ok "Python 3.10 ativo"
+    if ! command -v pyenv >/dev/null; then
+        err "pyenv não encontrado!"
+        return
+    fi
+
+    eval "$(pyenv init -)"
+
+    sudo apt install -y \
+        make build-essential libssl-dev zlib1g-dev \
+        libbz2-dev libreadline-dev libsqlite3-dev \
+        curl libncurses-dev xz-utils tk-dev \
+        libxml2-dev libxmlsec1-dev libffi-dev liblzma-dev
+
+    if pyenv versions --bare | grep -q "^3.10"; then
+        ok "Python 3.10 já instalado"
+    else
+        log "Instalando Python 3.10..."
+        pyenv install 3.10.13
+        ok "Python 3.10 instalado"
+    fi
+
+    pyenv global 3.10.13
+    pyenv rehash
+
+    ok "Python 3.10 configurado como padrão"
+
+    if ! grep -q "alias python3=" ~/.zshrc; then
+        echo 'alias python3="python"' >> ~/.zshrc
+        echo 'alias pip3="pip"' >> ~/.zshrc
     fi
 }
 
