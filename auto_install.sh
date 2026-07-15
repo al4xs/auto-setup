@@ -309,10 +309,31 @@ _scan_nvim() {
         ok)
             local lazy_count; lazy_count=$(ls -A "$HOME/.local/share/nvim/lazy" 2>/dev/null | wc -l)
             COMP_STATE[nvim]="ok"
-            COMP_DETAIL[nvim]="$(nvim --version 2>/dev/null | head -1), $lazy_count plugins"
+            COMP_DETAIL[nvim]="$(_nvim_version_line), $lazy_count plugins"
             ;;
         missing_nvim)
             COMP_STATE[nvim]="missing"; COMP_DETAIL[nvim]=""
+            ;;
+        outdated_nvim)
+            # BUG 1 (corrigido): este ramo estava ausente — _check_nvim_state()
+            # já retornava "outdated_nvim" para versões abaixo de
+            # $_NVIM_MIN_VERSION (ex.: 0.4.3 vindo de repositórios apt
+            # antigos), mas como o `case` aqui não tratava esse valor,
+            # COMP_STATE[nvim] nunca era definido, e o Neovim sumia do
+            # relatório em vez de aparecer como desatualizado.
+            #
+            # BUG 2 (corrigido): _NVIM_DIAG_VERSION/_NVIM_DIAG_PATH são
+            # setadas dentro de _check_nvim_state()/_nvim_diagnose(), mas
+            # essa função é sempre chamada via `s=$(_check_nvim_state)` —
+            # command substitution roda em SUBSHELL, então aquelas variáveis
+            # globais eram definidas e descartadas junto com o subshell,
+            # nunca chegando até aqui. Por isso chamamos _nvim_diagnose
+            # novamente, desta vez sem subshell, só para popular as
+            # variáveis de diagnóstico no processo atual (é uma função só de
+            # leitura — chamar de novo é barato e idempotente).
+            _nvim_diagnose
+            COMP_STATE[nvim]="$STATE_UPDATE"
+            COMP_DETAIL[nvim]="${_NVIM_DIAG_VERSION:-?} em ${_NVIM_DIAG_PATH:-?} — exige >= $_NVIM_MIN_VERSION"
             ;;
         missing_config)
             COMP_STATE[nvim]="incomplete"; COMP_DETAIL[nvim]="binário ok, configuração al4xs ausente"
@@ -405,8 +426,11 @@ _scan_tor() {
         missing)
             COMP_STATE[tor]="missing"; COMP_DETAIL[tor]=""
             ;;
+        legacy_system_install)
+            COMP_STATE[tor]="broken"; COMP_DETAIL[tor]="instalação antiga em /opt/tor-browser (root:root, somente leitura) — causa raiz de 'já em execução, não responde'; será migrada"
+            ;;
         binary_missing)
-            COMP_STATE[tor]="broken"; COMP_DETAIL[tor]="instalação presente mas binário ausente/corrompido"
+            COMP_STATE[tor]="broken"; COMP_DETAIL[tor]="instalação presente mas binário ausente/corrompido/sem permissão de escrita"
             ;;
         desktop_missing)
             COMP_STATE[tor]="incomplete"; COMP_DETAIL[tor]="binário ok, .desktop ou launcher ausente"
@@ -465,6 +489,17 @@ _print_state_report() {
             skip)
                 echo -e "  ${BLUE}–${NC}  ${BOLD}${lbl}${NC} ignorado${detail:+  ($detail)}"
                 ;;
+            *)
+                # Rede de segurança: NUNCA deixar um componente desaparecer
+                # silenciosamente do relatório. Se o estado for vazio/
+                # desconhecido (ex.: um _scan_* não tratou algum valor de
+                # retorno e esqueceu de popular COMP_STATE[$key]), isso
+                # aparece explicitamente como erro em vez de sumir da lista —
+                # foi exatamente esse tipo de lacuna (estado "outdated_nvim"
+                # sem ramo correspondente em _scan_nvim) que fazia o Neovim
+                # sumir do relatório mesmo quando o scan rodava normalmente.
+                echo -e "  ${RED}?${NC}  ${BOLD}${lbl}${NC} ${RED}ESTADO DESCONHECIDO${NC} (\"$state\")${detail:+  — $detail}"
+                ;;
         esac
     }
 
@@ -496,17 +531,19 @@ _is_ok() {
     [ "$s" = "ok" ] || [ "$s" = "skip" ]
 }
 
-# ────── Auto-reparo: broken/incomplete ──────────────────────────────────────
+# ────── Auto-reparo: broken/incomplete/update ───────────────────────────────
 # Componentes que já foram instalados (broken/incomplete) são reparados
-# automaticamente, sem perguntas. A exceção é "wrong_config" no Neovim
-# (ação destrutiva — ainda pede confirmação).
+# automaticamente, sem perguntas. "update" (ex.: Neovim desatualizado, como um
+# 0.4.3 vindo do apt) também entra aqui — deve ser corrigido automaticamente,
+# nunca apenas relatado sem ação. A exceção é "wrong_config" no Neovim (ação
+# destrutiva — ainda pede confirmação, tratada dentro de install_nvim).
 _repair_components() {
     local to_repair=()
 
     for key in deps node zsh pyenv python310 nvim dotnet locale \
                 vscode chrome postman burpsuite tor; do
         local s="${COMP_STATE[$key]:-}"
-        [ "$s" = "broken" ] || [ "$s" = "incomplete" ] && to_repair+=("$key")
+        { [ "$s" = "broken" ] || [ "$s" = "incomplete" ] || [ "$s" = "$STATE_UPDATE" ]; } && to_repair+=("$key")
     done
 
     [ ${#to_repair[@]} -eq 0 ] && return 0
@@ -1455,9 +1492,165 @@ EOF
 #   - Verifica se o nvim abre sem erros
 #   - Corrige apenas o que estiver com problema
 #
+# AstroNvim v4 (usado pelo al4xs/neovim-config) exige Neovim >= 0.11.0.
+# Esse valor já é, por si só, mais rígido que o mínimo absoluto do próprio
+# AstroNvim (>= 0.9.0) — ou seja, qualquer nvim < 0.11.0 (incluindo binários
+# antigos como o 0.4.3 que vem nos repositórios apt de distros mais antigas,
+# ex.: Ubuntu 20.04) é corretamente classificado como desatualizado.
+_NVIM_MIN_VERSION="0.11.0"
+
+# Diagnóstico populado por _nvim_diagnose(): versão encontrada, caminho do
+# binário resolvido e (quando aplicável) o motivo de reprovação. Usado para
+# exibir diagnóstico claro ao usuário (versão, `which nvim`, motivo), em vez
+# de apenas um estado interno.
+_NVIM_DIAG_VERSION=""
+_NVIM_DIAG_PATH=""
+_NVIM_DIAG_REASON=""
+
+# Compara duas versões "x.y.z". Retorna 0 (sucesso) se $1 >= $2.
+# Comparação real (numérica por segmento via `sort -V`), não comparação de
+# string — essencial para não classificar por engano, por exemplo, "0.9.0"
+# como maior que "0.11.0".
+_version_ge() {
+    # Robustez sob `set -Eeuo pipefail`: entradas não numéricas (ex.: "",
+    # "unknown" — o que _nvim_version() agora pode retornar) nunca devem
+    # travar o script nem ser mal comparadas por `sort -V` (que faz fallback
+    # lexicográfico para strings não-versão, o que poderia classificar
+    # "unknown" como "maior" que "0.11.0"). Qualquer entrada que não seja
+    # uma versão válida é tratada como reprovada (retorna 1), nunca quebra.
+    case "$1" in
+        ''|unknown) return 1 ;;
+    esac
+    case "$2" in
+        ''|unknown) return 1 ;;
+    esac
+    [ "$1" = "$2" ] && return 0
+    local higher
+    higher=$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -1) || higher=""
+    [ "$higher" = "$1" ]
+}
+
+# Consulta a versão do Neovim via o próprio binário (método oficial).
+#
+# Contrato (NUNCA pode derrubar o script, mesmo sob `set -Eeuo pipefail`,
+# e SEMPRE retorna exit 0 — quem chama decide o que fazer com o valor):
+#   - nvim não está no PATH            -> imprime "" (vazio)
+#   - nvim está no PATH mas falha ao   -> imprime "unknown"
+#     executar ou não reporta uma
+#     versão reconhecível (x.y.z)
+#   - nvim executa e reporta versão    -> imprime "x.y.z"
+_nvim_version() {
+    if ! command -v nvim >/dev/null 2>&1; then
+        printf ''
+        return 0
+    fi
+
+    local raw ver
+    # `|| true` em cada etapa: sob `pipefail`, se `nvim --version` falhar
+    # (binário quebrado, symlink pendurado, etc.) ou `grep` não encontrar
+    # nada, o pipeline inteiro retornaria não-zero e, como isto é uma
+    # atribuição simples (`raw=$(...)`), o `set -e` do script abortaria
+    # imediatamente ANTES de chegarmos a qualquer verificação de "$raw"
+    # vazio — foi exatamente essa a causa do erro relatado ("comando: head
+    # -1" no trap de ERR). O `|| true` garante que a função sempre segue
+    # até o `return 0` final.
+    raw=$(nvim --version 2>/dev/null | head -n1) || raw=""
+
+    if [ -z "$raw" ]; then
+        printf 'unknown'
+        return 0
+    fi
+
+    ver=$(printf '%s\n' "$raw" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1) || ver=""
+
+    if [ -z "$ver" ]; then
+        printf 'unknown'
+        return 0
+    fi
+
+    printf '%s' "$ver"
+    return 0
+}
+
+# Versão para exibição/log: a primeira linha completa de `nvim --version`
+# (ex.: "NVIM v0.11.2"), não apenas o número semver. Mesmo contrato de
+# robustez que _nvim_version(): nunca falha, nunca derruba o script.
+#   - nvim ausente do PATH -> ""
+#   - nvim presente mas `--version` falha ou não produz saída -> "unknown"
+#   - caso normal -> a linha ("NVIM v0.11.2")
+_nvim_version_line() {
+    if ! command -v nvim >/dev/null 2>&1; then
+        printf ''
+        return 0
+    fi
+    local line
+    line=$(nvim --version 2>/dev/null | head -n1) || line=""
+    printf '%s' "${line:-unknown}"
+    return 0
+}
+
+# Imprime diagnóstico do Neovim atualmente resolvido no PATH: versão
+# encontrada, caminho do binário (equivalente a `which nvim`) e, se
+# desatualizado, o motivo. Sempre roda antes da decisão de reparo para que o
+# usuário veja exatamente o que o script está enxergando no sistema.
+_nvim_diagnose() {
+    local bin_path ver
+    bin_path=$(command -v nvim 2>/dev/null || echo "(não encontrado)")
+    ver=$(_nvim_version)
+    _NVIM_DIAG_PATH="$bin_path"
+    _NVIM_DIAG_VERSION="${ver:-desconhecida}"
+
+    # CORREÇÃO: `log()` escreve no stdout (via `echo`). Como _check_nvim_state
+    # é sempre consumida via `s=$(_check_nvim_state)`, qualquer coisa que essa
+    # função (ou algo que ela chame) imprima em stdout entra na variável do
+    # chamador junto com o estado — foi exatamente isso que fez `s` virar um
+    # bloco de várias linhas ("Diagnóstico do Neovim:\n...\noutdated_nvim") em
+    # vez do valor único esperado. Todas as linhas de diagnóstico abaixo vão
+    # explicitamente para stderr (`>&2`), nunca para stdout, para que stdout
+    # fique reservado exclusivamente para o valor de estado.
+    {
+        log "Diagnóstico do Neovim:"
+        log "  Caminho do binário (which nvim): $bin_path"
+        log "  Versão encontrada: ${ver:-nenhuma}"
+
+        if [ -n "$ver" ] && _version_ge "$ver" "$_NVIM_MIN_VERSION"; then
+            _NVIM_DIAG_REASON=""
+            log "  Situação: versão compatível (>= $_NVIM_MIN_VERSION exigido pelo AstroNvim v4)"
+        elif [ -z "$ver" ]; then
+            _NVIM_DIAG_REASON="Neovim não encontrado no PATH"
+            log "  Situação: Neovim não instalado"
+        elif [ "$ver" = "unknown" ]; then
+            # nvim está no PATH mas `nvim --version` falhou ou não retornou
+            # uma versão reconhecível (ex.: symlink quebrado apontando para
+            # um binário inexistente/corrompido). Tratado como reprovado,
+            # igual a uma versão antiga — nunca como "compatível".
+            _NVIM_DIAG_REASON="nvim está no PATH ($bin_path) mas 'nvim --version' falhou ou não retornou uma versão reconhecível — o binário pode estar corrompido ou o symlink pode estar quebrado"
+            log "  Situação: BINÁRIO INVÁLIDO — $_NVIM_DIAG_REASON"
+        else
+            _NVIM_DIAG_REASON="versão $ver é menor que o mínimo exigido ($_NVIM_MIN_VERSION) pelo AstroNvim v4 usado em al4xs/neovim-config — binários antigos de repositórios apt (ex.: Ubuntu 20.04 entrega 0.4.3) não são suficientes"
+            log "  Situação: DESATUALIZADA — $_NVIM_DIAG_REASON"
+        fi
+    } >&2
+}
+
+# Consulta a quantidade de plugins via a própria API do lazy.nvim
+# (require("lazy").stats().count) em vez de contar diretórios no filesystem.
+_nvim_lazy_plugin_count() {
+    local out
+    out=$(timeout 20 nvim --headless \
+        -c "lua local ok,lazy=pcall(require,'lazy'); print(ok and lazy.stats().count or 0)" \
+        -c "qa!" 2>/dev/null | tr -dc '0-9')
+    [ -n "$out" ] && echo "$out" || echo "0"
+}
+
 _check_nvim_state() {
-    # Retorna: "missing_nvim" | "missing_config" | "wrong_config" | "missing_plugins" | "broken_startup" | "ok"
+    # Retorna: "missing_nvim" | "outdated_nvim" | "missing_config" | "wrong_config" | "missing_plugins" | "broken_startup" | "ok"
     local nvim_cfg="$HOME/.config/nvim"
+
+    # Sempre roda o diagnóstico primeiro (versão + caminho do binário +
+    # motivo), independente do resultado, para que o usuário veja exatamente
+    # o que foi detectado no sistema real (ex.: "/usr/bin/nvim, 0.4.3").
+    _nvim_diagnose
 
     # 1. nvim instalado?
     if ! command -v nvim >/dev/null 2>&1; then
@@ -1465,33 +1658,450 @@ _check_nvim_state() {
         return
     fi
 
-    # 2. Config existe?
+    # 2. Versão compatível com o AstroNvim (usado por al4xs/neovim-config)?
+    #    Verificação OBRIGATÓRIA por comparação real de versão (_version_ge),
+    #    nunca apenas "o binário existe". Um nvim antigo (ex.: 0.4.3, comum
+    #    em repositórios apt de distros como Ubuntu 20.04) é incompatível com
+    #    o AstroNvim v4 usado por al4xs/neovim-config e NUNCA deve ser aceito
+    #    como "ok".
+    local nvim_ver; nvim_ver=$(_nvim_version)
+    if [ -z "$nvim_ver" ] || ! _version_ge "$nvim_ver" "$_NVIM_MIN_VERSION"; then
+        echo "outdated_nvim"
+        return
+    fi
+
+    # 3. Config existe?
     if [ ! -d "$nvim_cfg" ]; then
         echo "missing_config"
         return
     fi
 
-    # 3. Config é al4xs/neovim-config?
+    # 4. Config é al4xs/neovim-config?
     if [ ! -d "$nvim_cfg/.git" ] || \
        ! git -C "$nvim_cfg" remote get-url origin 2>/dev/null | grep -qi "al4xs/neovim-config"; then
         echo "wrong_config"
         return
     fi
 
-    # 4. Plugins realmente instalados? (lazy.nvim cria ~/.local/share/nvim/lazy/)
-    local lazy_dir="$HOME/.local/share/nvim/lazy"
-    if [ ! -d "$lazy_dir" ] || [ -z "$(ls -A "$lazy_dir" 2>/dev/null)" ]; then
+    # 5. Plugins realmente instalados? Consulta o próprio lazy.nvim (fonte de
+    #    verdade), em vez de contar diretórios em ~/.local/share/nvim/lazy/.
+    local plugin_count; plugin_count=$(_nvim_lazy_plugin_count)
+    if [ "$plugin_count" -eq 0 ]; then
         echo "missing_plugins"
         return
     fi
 
-    # 5. Neovim abre sem erros?
+    # 6. Neovim abre sem erros?
     if ! timeout 15 nvim --headless -c "quit" >/dev/null 2>&1; then
         echo "broken_startup"
         return
     fi
 
     echo "ok"
+}
+
+# Instala/atualiza o Neovim usando o método oficial recomendado pelo Neovim
+# project para Linux: baixar o tarball pré-compilado publicado nos releases
+# oficiais do GitHub (github.com/neovim/neovim/releases) e instalar em
+# /opt/nvim, com um symlink em /usr/local/bin/nvim. Isso evita depender de
+# pacotes desatualizados do apt ou de canais snap que podem não satisfazer a
+# versão mínima exigida pelo AstroNvim.
+# CAUSA RAIZ do bug "binário extraído encontrado mas falha na validação de
+# versão" quando o sintoma é um erro de permissão (não de GLIBC — ver mais
+# abaixo para esse caso): em muitas instalações Ubuntu/Debian "endurecidas"
+# (servidores, imagens corporativas, algumas VMs de provedores cloud), o
+# diretório temporário padrão do sistema (/tmp, de onde vem $SETUP_TMP via
+# `mktemp -d` sem TMPDIR customizado) é montado com a opção `noexec` por
+# segurança. Isso não impede o download nem a extração do tarball — `curl`,
+# `tar -tzf` e a checagem de tipo via `file` continuam funcionando
+# normalmente, então tudo parece OK até aqui. O que falha é a PRÓPRIA
+# EXECUÇÃO do binário extraído (`"$extracted_bin" --version`): o kernel
+# recusa executar qualquer arquivo a partir de um filesystem montado
+# noexec, tipicamente com "Permission denied", mesmo o arquivo tendo
+# permissão de execução (`chmod +x`). Como essa chamada tinha stderr
+# redirecionado para /dev/null, o script só via "extracted_ver vazio" e
+# reportava um erro genérico de "não executa ou não reporta versão
+# reconhecível" — sem nunca revelar que a causa real era o ponto de
+# montagem, não o download nem o binário em si (que está correto).
+#
+# Correção: antes de baixar/extrair, testa se o diretório temporário
+# candidato realmente permite executar arquivos (grava um script minúsculo,
+# marca +x e tenta rodá-lo). Se $SETUP_TMP não permitir, usa um diretório
+# dentro de $HOME (quase nunca montado noexec, pois é necessário para rodar
+# o próprio shell/perfil do usuário) só para o download/extração/validação
+# do Neovim — sem alterar $SETUP_TMP global, usado por outras seções
+# (Node, Python, .NET) que não têm esse problema. Além disso, o stderr da
+# checagem de versão agora é capturado e exibido no erro, para que qualquer
+# outra causa futura apareça de forma diagnosticável em vez de silenciosa.
+_dir_allows_exec() {
+    local dir="$1" probe
+    probe="$dir/.exec-probe-$$"
+    { printf '#!/bin/sh\nexit 0\n' > "$probe"; } 2>/dev/null || return 1
+    chmod +x "$probe" 2>/dev/null || { rm -f "$probe"; return 1; }
+    "$probe" >/dev/null 2>&1
+    local rc=$?
+    rm -f "$probe"
+    return "$rc"
+}
+
+# Resolve um diretório de trabalho para o instalador do Neovim que
+# comprovadamente permite executar binários — nunca assume que $SETUP_TMP
+# serve sem testar primeiro.
+_nvim_work_dir() {
+    if _dir_allows_exec "$SETUP_TMP"; then
+        printf '%s' "$SETUP_TMP"
+        return 0
+    fi
+
+    warn "O diretório temporário padrão ($SETUP_TMP) está montado como 'noexec' — binários não podem ser executados a partir dele. Usando um diretório alternativo em \$HOME para a instalação do Neovim." >&2
+    local fallback="$HOME/.cache/dev-setup-nvim-tmp"
+    mkdir -p "$fallback" 2>/dev/null || true
+    if _dir_allows_exec "$fallback"; then
+        printf '%s' "$fallback"
+        return 0
+    fi
+
+    return 1
+}
+
+_install_nvim_official_binary() {
+    local nvim_arch
+    case "$ARCH" in
+        x86_64)        nvim_arch="linux-x86_64" ;;
+        aarch64|arm64) nvim_arch="linux-arm64"  ;;
+        *)
+            err "Arquitetura não suportada pelos releases oficiais do Neovim: $ARCH"
+            return 1
+            ;;
+    esac
+
+    local nvim_work_dir
+    nvim_work_dir=$(_nvim_work_dir) || {
+        err "Não foi possível encontrar um diretório (nem $SETUP_TMP nem \$HOME/.cache) que permita executar binários. Verifique as opções de montagem (mount | grep noexec) e libere um diretório sem 'noexec' para prosseguir."
+        return 1
+    }
+    if [ "$nvim_work_dir" != "$SETUP_TMP" ]; then
+        log "Usando diretório de trabalho alternativo (permite execução): $nvim_work_dir"
+    fi
+
+    local url="https://github.com/neovim/neovim/releases/latest/download/nvim-${nvim_arch}.tar.gz"
+    local archive="$nvim_work_dir/nvim-${nvim_arch}.tar.gz"
+
+    log "Baixando Neovim (release oficial): $url"
+    if ! curl -fsSL "$url" -o "$archive"; then
+        err "Falha no download do Neovim oficial."
+        return 1
+    fi
+    verify_download "$archive" 1000000 || return 1
+
+    # 1. Valida o TIPO real do arquivo baixado, não só o tamanho. Se o asset
+    #    do release mudar de nome/layout no GitHub (ou a URL cair numa
+    #    página de erro), `curl -fsSL` ainda grava um arquivo no disco —
+    #    só que é HTML, não gzip. `tar -tzf` sozinho às vezes só falha
+    #    tarde ou com mensagem confusa; `file` identifica isso de forma
+    #    inequívoca e permite abortar com uma mensagem clara.
+    if command -v file >/dev/null 2>&1; then
+        local file_type
+        file_type=$(file -b "$archive" 2>/dev/null) || file_type=""
+        case "$file_type" in
+            *gzip*|*"POSIX tar"*|*"tar archive"*) ;;
+            *)
+                err "Download do Neovim não é um arquivo gzip/tar válido (tipo detectado: '${file_type:-desconhecido}')."
+                err "Isso normalmente significa que a URL retornou uma página HTML de erro em vez do instalador. URL usada: $url"
+                return 1
+                ;;
+        esac
+    else
+        warn "Comando 'file' não disponível — pulando validação de tipo do arquivo baixado (seguindo apenas com 'tar -tzf')."
+    fi
+
+    if ! tar -tzf "$archive" >/dev/null 2>&1; then
+        err "Arquivo do Neovim corrompido ou incompleto (tar -tzf falhou)."
+        return 1
+    fi
+
+    # 2. Extrai em um diretório TEMPORÁRIO isolado — nunca direto em
+    #    /opt/nvim. Só promovemos para /opt/nvim depois que o binário
+    #    extraído passar em TODAS as validações abaixo (requisito: nunca
+    #    deixar /opt/nvim quebrado se a validação falhar).
+    local extract_dir="$nvim_work_dir/nvim-extract"
+    rm -rf "$extract_dir"
+    mkdir -p "$extract_dir"
+    tar -xzf "$archive" -C "$extract_dir" \
+        || { err "Falha ao extrair o Neovim em $extract_dir."; return 1; }
+
+    # 3. Não assume um caminho fixo dentro do tarball. Os releases oficiais
+    #    do Neovim já mudaram de layout entre versões (ex.: diretório raiz
+    #    "nvim-linux64/" antigamente vs. "nvim-linux-x86_64/bin/nvim" hoje)
+    #    — localizar dinamicamente evita quebrar de novo se isso mudar.
+    local extracted_bin
+    extracted_bin=$(find "$extract_dir" -type f -name nvim -perm -u+x 2>/dev/null | head -n1) || extracted_bin=""
+    if [ -z "$extracted_bin" ]; then
+        err "Não foi possível localizar um binário 'nvim' executável dentro do tarball extraído em $extract_dir."
+        err "Conteúdo extraído: $(find "$extract_dir" -maxdepth 3 2>/dev/null | tr '\n' ' ')"
+        return 1
+    fi
+    log "Binário do Neovim localizado em: $extracted_bin"
+
+    # 4. Valida o binário ENCONTRADO diretamente, ainda no diretório
+    #    temporário — antes de tocar em /opt/nvim ou /usr/local/bin. Isola
+    #    problema de extração/arquitetura de problema de PATH/symlink.
+    #    `|| extracted_ver=""` é essencial sob `set -Eeuo pipefail`: se o
+    #    binário falhar ou `grep` não achar nada, o pipeline retornaria
+    #    não-zero e, nesta atribuição simples, derrubaria o script antes do
+    #    `if [ -z ... ]` abaixo rodar.
+    #
+    # Captura stderr da tentativa de execução (em vez de descartar para
+    # /dev/null) — se o binário falhar por causa do ponto de montagem
+    # (noexec), biblioteca ausente (glibc antiga) ou qualquer outro motivo,
+    # o motivo real aparece na mensagem de erro em vez de um "não executa"
+    # genérico e não-diagnosticável.
+    local extracted_raw_output extracted_ver
+    extracted_raw_output=$("$extracted_bin" --version 2>&1) || true
+    extracted_ver=$(printf '%s\n' "$extracted_raw_output" | head -n1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1) || extracted_ver=""
+    if [ -z "$extracted_ver" ]; then
+        # CAUSA RAIZ (confirmada em campo, Ubuntu 20.04.6 LTS): o release
+        # pré-compilado oficial ("nvim-linux-x86_64.tar.gz") é compilado num
+        # ambiente com uma glibc mais nova do que a que distros LTS mais
+        # antigas trazem. O sintoma é sempre o mesmo — o binário É
+        # encontrado e TEM permissão de execução, mas o dynamic linker se
+        # recusa a carregá-lo porque símbolos como GLIBC_2.32/2.33/2.34 não
+        # existem na libc do sistema:
+        #   nvim: /lib/x86_64-linux-gnu/libc.so.6: version `GLIBC_2.34' not found
+        # Isso NUNCA vai se resolver baixando o release "latest" de novo —
+        # é incompatibilidade binária real com a glibc instalada, não uma
+        # falha de download/extração/PATH. A única correção de causa raiz é
+        # não depender de um binário pré-compilado para essas versões de
+        # glibc: compilar o Neovim localmente, contra a própria glibc do
+        # sistema, elimina o descompasso de vez (é exatamente o que
+        # `_install_nvim_from_source` faz, chamada automaticamente abaixo
+        # quando esse padrão é detectado).
+        if printf '%s' "$extracted_raw_output" | grep -q 'GLIBC_'; then
+            warn "O release pré-compilado do Neovim exige uma versão de GLIBC mais nova do que a instalada neste sistema:"
+            printf '%s\n' "$extracted_raw_output" | grep 'GLIBC_' | while IFS= read -r line; do warn "  $line"; done
+            warn "Binário pré-compilado incompatível com a glibc do sistema — compilando o Neovim a partir do código-fonte (contra a glibc local) em vez de usar o binário oficial."
+            _install_nvim_from_source "$nvim_work_dir"
+            return $?
+        fi
+
+        err "O binário encontrado ($extracted_bin) não executa (ou não reporta uma versão reconhecível). Extração do Neovim falhou."
+        if [ -n "$extracted_raw_output" ]; then
+            err "Saída/erro real ao tentar executar o binário: $(printf '%s' "$extracted_raw_output" | head -n3 | tr '\n' ' ')"
+        fi
+        case "$extracted_raw_output" in
+            *"Permission denied"*)
+                err "Isso costuma indicar que '$extract_dir' está em um filesystem montado com 'noexec' (verifique: mount | grep \"$(df -P "$extract_dir" 2>/dev/null | tail -1 | awk '{print $NF}')\")."
+                ;;
+            *"No such file or directory"*)
+                err "Isso costuma indicar uma biblioteca dinâmica ausente ou o interpretador ELF (/lib64/ld-linux-x86-64.so.2) ausente no sistema."
+                ;;
+        esac
+        return 1
+    fi
+    if ! _version_ge "$extracted_ver" "$_NVIM_MIN_VERSION"; then
+        err "O binário extraído ($extracted_bin) reporta versão $extracted_ver, abaixo do mínimo exigido ($_NVIM_MIN_VERSION). O release oficial baixado não satisfaz o requisito do AstroNvim v4."
+        return 1
+    fi
+    log "Binário validado no diretório temporário: $extracted_bin --version = $extracted_ver"
+
+    # 5. Só agora, com o binário já validado, promovemos para /opt/nvim.
+    local release_root
+    release_root=$(dirname "$(dirname "$extracted_bin")")
+    _promote_and_validate_nvim "$release_root" "release pré-compilado oficial"
+}
+
+# Promove um diretório de instalação do Neovim JÁ VALIDADO (contém bin/nvim
+# funcional, com versão compatível) para /opt/nvim, cria o symlink em
+# /usr/local/bin/nvim e faz a validação final via PATH — com backup e
+# rollback automático da instalação anterior se qualquer etapa falhar.
+# Compartilhada entre a instalação via binário pré-compilado e a compilação
+# a partir do código-fonte para nunca duplicar a lógica de
+# backup/promoção/rollback entre os dois caminhos.
+#
+#   $1 - release_root: diretório que contém bin/nvim (e share/, lib/ etc.)
+#        já validado e pronto para ser movido para /opt/nvim.
+#   $2 - install_desc: descrição legível do método usado, só para a
+#        mensagem final de sucesso (ex.: "release pré-compilado oficial" ou
+#        "compilado a partir do código-fonte (branch stable)").
+_promote_and_validate_nvim() {
+    local release_root="$1" install_desc="$2"
+
+    # Move a RAIZ do release (diretório que contém bin/nvim, e também
+    # share/, lib/ etc. necessários em tempo de execução), não só o binário
+    # isolado — copiar apenas o binário quebraria runtime files (ex.:
+    # syntax highlighting, terminfo).
+    #
+    # Faz backup do /opt/nvim anterior (se existir) e só o remove de
+    # verdade no final, depois que a validação pós-instalação também
+    # passar. Se qualquer coisa falhar a partir daqui, a instalação
+    # anterior é restaurada — /opt/nvim nunca fica num estado quebrado
+    # (nem "meio extraído", nem "apagado sem substituto funcional"). Isso
+    # também cobre o requisito de "remover a instalação quebrada atual": se
+    # /opt/nvim ou o symlink em /usr/local/bin/nvim já existiam quebrados
+    # (de uma tentativa anterior), eles são substituídos aqui mesmo.
+    local backup_dir=""
+    if [ -d /opt/nvim ]; then
+        backup_dir="$SETUP_TMP/nvim-opt-backup"
+        sudo rm -rf "$backup_dir"
+        sudo mv /opt/nvim "$backup_dir" \
+            || { err "Falha ao fazer backup da instalação anterior em /opt/nvim antes de atualizar."; return 1; }
+    fi
+
+    if ! sudo mv "$release_root" /opt/nvim; then
+        err "Falha ao mover a instalação validada para /opt/nvim."
+        if [ -n "$backup_dir" ]; then
+            sudo mv "$backup_dir" /opt/nvim && err "Instalação anterior restaurada em /opt/nvim." \
+                || err "FALHA AO RESTAURAR o backup em $backup_dir — /opt/nvim pode estar ausente. Restaure manualmente: sudo mv $backup_dir /opt/nvim"
+        fi
+        return 1
+    fi
+
+    # Symlink idempotente: `ln -sf` sobrescreve se já existir (inclusive um
+    # symlink quebrado apontando para um /opt/nvim antigo), sem erro.
+    sudo ln -sf /opt/nvim/bin/nvim /usr/local/bin/nvim
+
+    # Garante que a sessão atual do script enxergue o symlink novo antes de
+    # validar: `hash -r` limpa o cache de localização de comandos do bash,
+    # e o PATH precisa ter /usr/local/bin (só é adicionado se realmente
+    # ausente do PATH).
+    hash -r 2>/dev/null || true
+    case ":$PATH:" in
+        *:/usr/local/bin:*) ;;
+        *) export PATH="/usr/local/bin:$PATH" ;;
+    esac
+    hash -r 2>/dev/null || true
+
+    # Validação final via PATH (como o restante do script vai usar o
+    # comando `nvim` diretamente, é isso que precisa funcionar).
+    # `|| resolved_path=""` protege contra `command -v` retornando não-zero
+    # (nvim não encontrado) derrubar o script via `set -e` antes da
+    # checagem explícita abaixo. `_nvim_version` já é auto-contida e nunca
+    # falha (contrato descrito na própria função).
+    local resolved_path resolved_ver
+    resolved_path=$(command -v nvim 2>/dev/null) || resolved_path=""
+    resolved_ver=$(_nvim_version)
+
+    # /usr/local/bin/nvim é EXATAMENTE o resultado esperado (é o symlink que
+    # acabamos de criar) — não é suspeito, é sucesso. A única coisa que
+    # realmente importa validar é a versão relatada pelo binário resolvido,
+    # não o caminho em si.
+    if [ -z "$resolved_path" ] || [ -z "$resolved_ver" ] || ! _version_ge "$resolved_ver" "$_NVIM_MIN_VERSION"; then
+        err "Validação pós-instalação falhou: 'nvim' no PATH resolve para '${resolved_path:-(não encontrado)}' (versão: ${resolved_ver:-desconhecida}), mesmo com o binário validado em /opt/nvim/bin/nvim."
+        err "Isso indica um problema de PATH/symlink, não da instalação em si — verifique 'ls -l /usr/local/bin/nvim' e se /usr/local/bin está no PATH."
+        if [ -n "$backup_dir" ]; then
+            sudo rm -rf /opt/nvim
+            sudo mv "$backup_dir" /opt/nvim && err "Instalação anterior restaurada em /opt/nvim (rollback)." \
+                || err "FALHA AO RESTAURAR o backup em $backup_dir — /opt/nvim pode estar ausente. Restaure manualmente: sudo mv $backup_dir /opt/nvim"
+        fi
+        return 1
+    fi
+
+    # Sucesso confirmado — descarta o backup da instalação anterior.
+    [ -n "$backup_dir" ] && sudo rm -rf "$backup_dir"
+
+    # Garante que o PATH também priorize /usr/local/bin nas próximas sessões
+    # de shell do usuário (idempotente — não duplica se já existir).
+    add_generic_export_block "# Neovim oficial — garante que /usr/local/bin esteja no PATH (setup.sh)" \
+'
+# Neovim oficial — garante que /usr/local/bin esteja no PATH (setup.sh)
+export PATH="/usr/local/bin:$PATH"'
+
+    ok "Neovim instalado ($install_desc) em /opt/nvim (symlink /usr/local/bin/nvim) — ativo: $resolved_ver em $resolved_path"
+}
+
+# Compila o Neovim a partir do código-fonte, contra a glibc do PRÓPRIO
+# sistema — é o único jeito de garantir compatibilidade quando o release
+# pré-compilado oficial exige uma glibc mais nova do que a instalada (caso
+# confirmado em Ubuntu 20.04.6 LTS, glibc 2.31, com o release exigindo
+# GLIBC_2.32/2.33/2.34). Usa a branch "stable" do repositório oficial —
+# ela é atualizada pelo próprio projeto Neovim a cada release estável, então
+# isso sempre compila a versão estável mais recente sem hardcodar nenhum
+# número de versão aqui (mesmo princípio de nunca fixar versões usado na
+# seção do .NET SDK).
+_install_nvim_from_source() {
+    local nvim_work_dir="$1"
+
+    # Identifica a distro/versão apenas para diagnóstico e log — a decisão
+    # de compilar a partir do código-fonte já foi tomada com base no
+    # sintoma real (falha de GLIBC ao executar o binário pré-compilado),
+    # não no nome da distro. Isso deixa a correção funcionando também em
+    # qualquer outra distro/versão com glibc antiga (Debian antigo, outras
+    # LTS), não só "Ubuntu 20.04" no nome.
+    if [ -r /etc/os-release ]; then
+        local distro_name distro_version
+        distro_name=$(. /etc/os-release; echo "${NAME:-desconhecida}")
+        distro_version=$(. /etc/os-release; echo "${VERSION_ID:-desconhecida}")
+        log "Sistema detectado: $distro_name $distro_version"
+    fi
+    local glibc_ver
+    glibc_ver=$(ldd --version 2>/dev/null | head -n1 | grep -oE '[0-9]+\.[0-9]+$') || glibc_ver=""
+    log "glibc do sistema: ${glibc_ver:-desconhecida} — compilando o Neovim localmente para compilar contra ela diretamente."
+
+    header "Neovim: compilando a partir do código-fonte (fallback de compatibilidade de glibc)"
+
+    # Dependências de build documentadas pelo próprio projeto Neovim
+    # (BUILD.md) para compilação a partir do código-fonte em Debian/Ubuntu.
+    log "Instalando dependências de compilação do Neovim..."
+    apt_install ninja-build gettext cmake unzip curl build-essential pkg-config \
+        libtool libtool-bin autoconf automake \
+        || { err "Falha ao instalar dependências de compilação do Neovim."; return 1; }
+
+    local src_dir="$nvim_work_dir/nvim-src"
+    rm -rf "$src_dir"
+    log "Clonando neovim/neovim (branch stable — sempre a versão estável mais recente)..."
+    if ! git clone --depth=1 --branch stable https://github.com/neovim/neovim.git "$src_dir" >>"$LOG_FILE" 2>&1; then
+        err "Falha ao clonar o código-fonte do Neovim (branch stable)."
+        return 1
+    fi
+
+    local stage_prefix="$nvim_work_dir/nvim-src-install"
+    rm -rf "$stage_prefix"
+    mkdir -p "$stage_prefix"
+
+    local jobs
+    jobs=$(nproc 2>/dev/null || echo 2)
+
+    log "Compilando o Neovim a partir do código-fonte (pode levar vários minutos)..."
+    if ! (cd "$src_dir" && make CMAKE_BUILD_TYPE=RelWithDebInfo CMAKE_INSTALL_PREFIX="$stage_prefix" -j"$jobs") >>"$LOG_FILE" 2>&1; then
+        err "Falha ao compilar o Neovim a partir do código-fonte. Consulte o log completo: $LOG_FILE"
+        rm -rf "$src_dir"
+        return 1
+    fi
+
+    if ! (cd "$src_dir" && make install) >>"$LOG_FILE" 2>&1; then
+        err "Falha ao instalar o Neovim compilado em $stage_prefix. Consulte o log completo: $LOG_FILE"
+        rm -rf "$src_dir"
+        return 1
+    fi
+
+    local built_bin="$stage_prefix/bin/nvim"
+    if [ ! -x "$built_bin" ]; then
+        err "Compilação concluída mas o binário esperado não foi encontrado em $built_bin."
+        rm -rf "$src_dir"
+        return 1
+    fi
+
+    local built_raw_output built_ver
+    built_raw_output=$("$built_bin" --version 2>&1) || true
+    built_ver=$(printf '%s\n' "$built_raw_output" | head -n1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1) || built_ver=""
+    if [ -z "$built_ver" ]; then
+        err "O Neovim compilado localmente não executa ou não reporta uma versão reconhecível."
+        [ -n "$built_raw_output" ] && err "Saída/erro real: $(printf '%s' "$built_raw_output" | head -n3 | tr '\n' ' ')"
+        rm -rf "$src_dir"
+        return 1
+    fi
+    if ! _version_ge "$built_ver" "$_NVIM_MIN_VERSION"; then
+        err "O Neovim compilado a partir da branch stable reporta versão $built_ver, abaixo do mínimo exigido ($_NVIM_MIN_VERSION)."
+        rm -rf "$src_dir"
+        return 1
+    fi
+    log "Binário compilado localmente validado: $built_bin --version = $built_ver"
+
+    # Código-fonte não é mais necessário depois de instalado no prefixo de
+    # staging — pode ocupar bastante espaço (repo + artefatos de build).
+    rm -rf "$src_dir"
+
+    _promote_and_validate_nvim "$stage_prefix" "compilado a partir do código-fonte (branch stable, glibc do sistema)"
 }
 
 install_nvim() {
@@ -1518,8 +2128,8 @@ install_nvim() {
 
     case "$state" in
         ok)
-            local nvim_ver; nvim_ver=$(nvim --version | head -1)
-            local lazy_count; lazy_count=$(ls -A "$HOME/.local/share/nvim/lazy" 2>/dev/null | wc -l)
+            local nvim_ver; nvim_ver=$(_nvim_version_line)
+            local lazy_count; lazy_count=$(_nvim_lazy_plugin_count)
             _report_state "Neovim" "$STATE_OK" "$nvim_ver, $lazy_count plugins, abre sem erros"
             ok "Neovim funcionando corretamente — mantido"
             SUMMARY[nvim]="Mantido e verificado ($nvim_ver, $lazy_count plugins)"
@@ -1527,6 +2137,16 @@ install_nvim() {
             ;;
         missing_nvim)
             _report_state "Neovim" "$STATE_MISSING"
+            ;;
+        outdated_nvim)
+            # _NVIM_DIAG_* são setadas dentro de _check_nvim_state()/
+            # _nvim_diagnose(), mas o `state=$(_check_nvim_state)` acima (e o
+            # scan anterior) rodam em subshell — as variáveis não sobrevivem.
+            # Chamamos de novo aqui, fora de subshell, para ter os valores
+            # corretos na mensagem de estado.
+            _nvim_diagnose
+            _report_state "Neovim" "$STATE_UPDATE" "${_NVIM_DIAG_VERSION} em ${_NVIM_DIAG_PATH:-?}, AstroNvim exige >= $_NVIM_MIN_VERSION — ${_NVIM_DIAG_REASON:-versão incompatível}"
+            warn "Versão do Neovim incompatível com o AstroNvim — atualizando pelo método oficial"
             ;;
         missing_config)
             _report_state "Neovim" "$STATE_BROKEN" "binário presente mas configuração ausente"
@@ -1548,21 +2168,25 @@ install_nvim() {
     # ── Instala o nvim se ausente ─────────────────────────────────────────────
     if [ "$state" = "missing_nvim" ]; then
         log "Instalando Neovim..."
-        # Tenta instalar versão mais recente via snap (se disponível), pois a
-        # versão do apt pode ser muito antiga para configurações modernas.
-        if command -v snap >/dev/null 2>&1; then
-            if snap install nvim --classic 2>/dev/null; then
-                ok "Neovim instalado via snap ($(nvim --version | head -1))"
-            else
-                warn "snap install falhou — tentando via apt..."
-                apt_install neovim || { err "Falha ao instalar o pacote neovim."; return 1; }
-                ok "Neovim instalado via apt ($(nvim --version | head -1))"
-            fi
-        else
-            apt_install neovim || { err "Falha ao instalar o pacote neovim."; return 1; }
-            ok "Neovim instalado via apt ($(nvim --version | head -1))"
-        fi
+        _install_nvim_official_binary \
+            || { err "Falha ao instalar o Neovim."; return 1; }
         state="missing_config"
+    fi
+
+    # ── Atualiza o nvim se a versão for incompatível com o AstroNvim ─────────
+    if [ "$state" = "outdated_nvim" ]; then
+        log "Atualizando Neovim para >= $_NVIM_MIN_VERSION (release oficial)..."
+        _install_nvim_official_binary \
+            || { err "Falha ao atualizar o Neovim."; return 1; }
+        ok "Neovim atualizado ($(_nvim_version))"
+        # Depois de atualizar o binário, reavalia o restante do estado
+        # (config/plugins) a partir do zero.
+        state=$(_check_nvim_state)
+        case "$state" in
+            missing_config)   _report_state "Neovim" "$STATE_BROKEN" "binário atualizado, configuração al4xs ausente" ;;
+            wrong_config)     _report_state "Neovim" "$STATE_BROKEN" "configuração existente não é al4xs/neovim-config" ;;
+            missing_plugins)  _report_state "Neovim" "$STATE_BROKEN" "config ok mas plugins não foram instalados" ;;
+        esac
     fi
 
     # ── Instala dependências necessárias ─────────────────────────────────────
@@ -1610,15 +2234,35 @@ install_nvim() {
         || warn "Não foi possível instalar 'pynvim' (opcional para plugins Python)."
 
     # ── Sincroniza plugins via lazy.nvim ─────────────────────────────────────
+    # CAUSA RAIZ do bug original: ":Lazy! sync" (disparado via "+Lazy! sync"
+    # na linha de comando) apenas *inicia* um job assíncrono (git clone/build
+    # dos plugins) — ele não bloqueia o Neovim até terminar. Ao encadear
+    # "+qa" logo em seguida, o Neovim fechava imediatamente após disparar o
+    # comando, matando os jobs de instalação antes que terminassem de
+    # verdade. Por isso o script podia reportar "Plugins sincronizados com
+    # sucesso" (o comando em si não retornou erro) mesmo com
+    # "~/.local/share/nvim/lazy" vazio e "0 plugins" no resumo final.
+    #
+    # Correção: usar a API Lua do lazy.nvim com "wait = true", que bloqueia
+    # de verdade até a sincronização terminar (opção documentada
+    # exatamente para uso em scripts/CI headless, ao contrário do comando
+    # ":Lazy sync" pensado para a UI interativa).
     log "Sincronizando plugins do Neovim (pode levar alguns minutos na primeira vez)..."
     local sync_ok=false
-    if timeout 300 nvim --headless "+Lazy! sync" +qa >>"$LOG_FILE" 2>&1; then
+    if timeout 300 nvim --headless \
+        -c "lua require('lazy').sync({ wait = true, show = false })" \
+        -c "qa" >>"$LOG_FILE" 2>&1; then
         sync_ok=true
         ok "Plugins sincronizados com sucesso"
     else
-        warn "Sincronização via '+Lazy! sync' retornou código não-zero — tentando método alternativo..."
-        # Fallback: tenta via +Lazy sync sem o '!' (versões mais antigas do lazy.nvim)
-        if timeout 300 nvim --headless "+Lazy sync" +qa >>"$LOG_FILE" 2>&1; then
+        warn "Sincronização via API do lazy.nvim (wait=true) retornou código não-zero — tentando método alternativo..."
+        # Fallback para versões de lazy.nvim sem suporte à opção 'wait' na
+        # API de sync: tenta 'install' (também com wait=true) apenas para
+        # os plugins que ainda faltam, em vez de repetir o comando de UI
+        # não-bloqueante que causou o problema original.
+        if timeout 300 nvim --headless \
+            -c "lua require('lazy').install({ wait = true, show = false })" \
+            -c "qa" >>"$LOG_FILE" 2>&1; then
             sync_ok=true
             ok "Plugins sincronizados (método alternativo)"
         else
@@ -1627,12 +2271,13 @@ install_nvim() {
     fi
 
     # ── Verifica se plugins foram realmente instalados ────────────────────────
-    local lazy_dir="$HOME/.local/share/nvim/lazy"
-    if [ -d "$lazy_dir" ] && [ -n "$(ls -A "$lazy_dir" 2>/dev/null)" ]; then
-        local plugin_count; plugin_count=$(ls -A "$lazy_dir" | wc -l)
-        ok "Plugins instalados: $plugin_count diretórios em $lazy_dir"
+    # Usa a própria API do lazy.nvim (fonte de verdade) em vez de contar
+    # diretórios em ~/.local/share/nvim/lazy/.
+    local plugin_count; plugin_count=$(_nvim_lazy_plugin_count)
+    if [ "$plugin_count" -gt 0 ]; then
+        ok "Plugins instalados: $plugin_count (via lazy.nvim)"
     else
-        warn "Diretório de plugins não encontrado ou vazio: $lazy_dir"
+        warn "Nenhum plugin reportado pelo lazy.nvim."
         warn "Isso pode indicar falha na sincronização. Tente abrir o Neovim manualmente e execute :Lazy sync"
         warn "Log da sincronização: $LOG_FILE"
     fi
@@ -1644,8 +2289,8 @@ install_nvim() {
 
     if [ -z "$startup_errors" ]; then
         ok "Neovim abre corretamente, sem erros"
-        local final_ver; final_ver=$(nvim --version | head -1)
-        local final_count; final_count=$(ls -A "$lazy_dir" 2>/dev/null | wc -l || echo "?")
+        local final_ver; final_ver=$(_nvim_version_line)
+        local final_count; final_count=$(_nvim_lazy_plugin_count)
         SUMMARY[nvim]="Instalado e validado ($final_ver, $final_count plugins)"
     else
         # Filtra mensagens que não são erros reais (algumas configs emitem avisos normais)
@@ -1653,7 +2298,7 @@ install_nvim() {
         real_errors=$(echo "$startup_errors" | grep -iE "^E[0-9]+:|error:|failed:" || true)
         if [ -z "$real_errors" ]; then
             ok "Neovim abre com avisos não-críticos (normal para configs complexas)"
-            SUMMARY[nvim]="Instalado ($(nvim --version | head -1))"
+            SUMMARY[nvim]="Instalado ($(_nvim_version_line))"
         else
             warn "Neovim apresentou erros ao abrir:"
             echo "$real_errors" | while IFS= read -r line; do warn "  $line"; done
@@ -2145,13 +2790,72 @@ install_burpsuite() {
 #   - Verifica se o launcher na CLI existe
 #   - Corrige apenas o que estiver com problema
 #
+
+# Diretório de instalação do Tor Browser.
+#
+# CAUSA RAIZ (investigada lendo o start-tor-browser oficial do próprio tarball
+# do Tor Project, versão 15.0.18, linux-x86_64): o Tor Browser é distribuído
+# como um "portable app" auto-contido. O script start-tor-browser:
+#   1. Ao ser executado sem um usuário system_install (marcador de arquivo
+#      "is-packaged-app" ausente — que é o nosso caso), faz `cd` para o seu
+#      próprio diretório e, se não for uma instalação "empacotada", copia e
+#      reescreve `start-tor-browser.desktop` dentro do PRÓPRIO diretório pai
+#      da instalação a cada execução (`cp start-tor-browser.desktop ../` e
+#      `sed -i` nesse arquivo), além de criar `.config/ibus/` e symlinks
+#      dentro do próprio diretório da instalação.
+#   2. Ele redefine a variável de ambiente HOME para o próprio diretório da
+#      instalação (`HOME="$browser_dir"`) antes de iniciar o Firefox.
+#   3. O perfil real do navegador (TorBrowser/Data/Browser/profile.default,
+#      referenciado por profiles.ini com IsRelative=1) fica DENTRO da própria
+#      árvore de instalação — não em ~/.mozilla nem em nenhum outro lugar
+#      redirecionável — e o Firefox precisa criar/gravar nele (lock, cache,
+#      cookies, sqlite, etc.) toda vez que abre.
+#
+# Ou seja: a ÁRVORE INTEIRA da instalação precisa permanecer gravável pelo
+# usuário que executa o navegador. Não existe, no tarball oficial, um modo
+# suportado de instalação somente-leitura, compartilhada entre múltiplos
+# usuários, com dono root (isso é uma característica de empacotadores de
+# distro como o torbrowser-launcher do Debian, que faz algo bem diferente:
+# baixa uma cópia própria por usuário dentro do HOME de cada um).
+#
+# O script anterior instalava em /opt/tor-browser com `chown root:root` e
+# `chmod a+rX` (leitura/execução para todos, mas SEM escrita para o usuário
+# comum). Isso faz com que, ao abrir o Tor Browser, o Firefox não consiga
+# criar o arquivo de lock do perfil (permissão negada) e todas as tentativas
+# de auto-modificação do próprio start-tor-browser falhem silenciosamente
+# (a saída delas vai para /dev/null por padrão, a menos que se use
+# `--verbose`/`--log`). O código do Firefox/XUL trata QUALQUER falha ao
+# obter o lock do perfil — inclusive erro de permissão — com a mesma caixa de
+# diálogo genérica "O Navegador Tor já está em execução, mas não está
+# respondendo", mesmo sem existir processo algum nem arquivo de lock (porque
+# o lock nunca chega a ser criado). Isso explica exatamente os sintomas
+# relatados: nenhum processo, nenhum lock, erro reproduzível sempre.
+#
+# CORREÇÃO: instalar em um diretório dentro do HOME do próprio usuário,
+# pertencente a ele e com permissões normais de leitura/escrita/execução —
+# exatamente como a documentação oficial do Tor Project recomenda ("não são
+# necessários privilégios especiais para executar o Tor Browser"; basta
+# extrair o pacote em qualquer lugar acessível ao usuário).
+TOR_INSTALL_DIR="$HOME/.local/opt/tor-browser"
+# Caminho antigo (incorreto) usado por versões anteriores deste script —
+# mantido apenas para detecção/migração de instalações legadas quebradas.
+_TOR_LEGACY_SYSTEM_DIR="/opt/tor-browser"
+
 _check_tor_state() {
-    # Retorna: "missing" | "binary_missing" | "desktop_missing" | "desktop_broken" | "ok"
-    local install_dir="/opt/tor-browser"
+    # Retorna: "missing" | "legacy_system_install" | "binary_missing" | "desktop_missing" | "desktop_broken" | "ok"
+    local install_dir="$TOR_INSTALL_DIR"
     local binary="$install_dir/Browser/start-tor-browser"
     local firefox_bin="$install_dir/Browser/firefox.real"
     local desktop="/usr/share/applications/tor-browser.desktop"
     local cli_launcher="/usr/local/bin/tor-browser"
+
+    # Instalação legada (versões anteriores deste script) em /opt/tor-browser,
+    # root:root, somente leitura — é exatamente a causa raiz do bug
+    # "já está em execução, mas não está respondendo". Precisa ser migrada.
+    if [ -d "$_TOR_LEGACY_SYSTEM_DIR" ] && [ ! -d "$install_dir" ]; then
+        echo "legacy_system_install"
+        return
+    fi
 
     # Nem diretório de perfil legado nem diretório de instalação existem
     if [ ! -d "$install_dir" ] && [ ! -d "$HOME/.local/share/torbrowser" ]; then
@@ -2171,6 +2875,15 @@ _check_tor_state() {
         return
     fi
 
+    # A árvore inteira precisa pertencer ao usuário atual e ser gravável por
+    # ele — sem isso o Firefox não consegue criar o lock do próprio perfil
+    # (ver comentário acima de TOR_INSTALL_DIR). Trata como "binary_missing"
+    # para forçar reinstalação/reparo completo dos donos e permissões.
+    if [ ! -O "$install_dir" ] || [ ! -w "$install_dir" ] || [ ! -w "$firefox_bin" ]; then
+        echo "binary_missing"
+        return
+    fi
+
     # Launcher CLI ausente
     if [ ! -x "$cli_launcher" ]; then
         echo "desktop_missing"
@@ -2184,7 +2897,7 @@ _check_tor_state() {
     fi
 
     # .desktop com Exec apontando para lugar errado
-    if ! grep -q "Exec=/opt/tor-browser/Browser/start-tor-browser" "$desktop" 2>/dev/null; then
+    if ! grep -q "Exec=$install_dir/Browser/start-tor-browser" "$desktop" 2>/dev/null; then
         echo "desktop_broken"
         return
     fi
@@ -2193,15 +2906,21 @@ _check_tor_state() {
 }
 
 _get_tor_latest_version() {
+    # Usa o endpoint oficial e não-depreciado de atualização do Tor Browser
+    # (o mesmo consultado pelo próprio Tor Browser para se auto-atualizar):
+    # https://aus1.torproject.org/torbrowser/update_3/release/download-<plataforma>.json
+    # A antiga URL "downloads.json" está marcada como depreciada pelo próprio
+    # Tor Project e usa chaves de plataforma/idioma que não existem mais
+    # (ex.: "linux64"/"en-US"), por isso a detecção de versão sempre falhava.
     local arch_key="$1"
     cat > "$SETUP_TMP/get_tor_ver.py" << PYEOF
 import urllib.request, json, sys
 try:
-    url = "https://aus1.torproject.org/torbrowser/update_3/release/downloads.json"
+    url = "https://aus1.torproject.org/torbrowser/update_3/release/download-$arch_key.json"
     with urllib.request.urlopen(url, timeout=15) as r:
         data = json.load(r)
     ver = data.get("version", "")
-    dl = data.get("downloads", {}).get("$arch_key", {}).get("en-US", {}).get("binary", "")
+    dl = data.get("binary", "")
     print(ver, dl)
 except Exception:
     sys.exit(1)
@@ -2212,7 +2931,7 @@ PYEOF
 # Cria o arquivo .desktop para o Tor Browser de forma robusta.
 # Não depende do arquivo estar no tarball — sempre gera do zero se necessário.
 _tor_create_desktop() {
-    local install_dir="/opt/tor-browser"
+    local install_dir="$TOR_INSTALL_DIR"
     local desktop_dest="/usr/share/applications/tor-browser.desktop"
 
     # Determina o ícone: tenta vários caminhos conhecidos dentro do pacote
@@ -2233,6 +2952,13 @@ _tor_create_desktop() {
 
     log "Criando entrada .desktop do Tor Browser (ícone: $icon_path)..."
 
+    # Observação sobre Path=: o start-tor-browser oficial já se autolocaliza
+    # via `cd "$(dirname "$(realpath "$0")")"`, então Path= não é
+    # estritamente necessário para o funcionamento (o .desktop oficial do
+    # próprio tarball também não usa essa chave). Ainda assim, incluímos
+    # Path= apontando para o diretório Browser/ como reforço defensivo, para
+    # garantir um cwd correto mesmo em ambientes de desktop atípicos — não
+    # tem custo e não conflita com o comportamento do script.
     sudo tee "$desktop_dest" > /dev/null << EOF
 [Desktop Entry]
 Version=1.0
@@ -2240,7 +2966,8 @@ Type=Application
 Name=Tor Browser
 GenericName=Web Browser
 Comment=Tor Browser is +1 for privacy and −1 for mass surveillance
-Exec=/opt/tor-browser/Browser/start-tor-browser %u
+Exec=$install_dir/Browser/start-tor-browser %u
+Path=$install_dir/Browser
 Icon=${icon_path}
 StartupWMClass=Tor Browser
 Categories=Network;WebBrowser;Security;
@@ -2259,10 +2986,15 @@ EOF
 }
 
 # Cria o launcher CLI do Tor Browser.
+# Este arquivo em si pode continuar pertencendo a root em /usr/local/bin
+# (é só um wrapper fino que dá exec no binário real) — ele não precisa
+# gravar nada, apenas invocar o start-tor-browser já instalado no HOME do
+# usuário, que é quem efetivamente precisa de permissão de escrita.
 _tor_create_cli_launcher() {
-    sudo tee /usr/local/bin/tor-browser > /dev/null << 'EOF'
+    local install_dir="$TOR_INSTALL_DIR"
+    sudo tee /usr/local/bin/tor-browser > /dev/null << EOF
 #!/usr/bin/env bash
-exec /opt/tor-browser/Browser/start-tor-browser "$@"
+exec "$install_dir/Browser/start-tor-browser" "\$@"
 EOF
     sudo chmod +x /usr/local/bin/tor-browser
     ok "Launcher CLI criado: /usr/local/bin/tor-browser"
@@ -2273,12 +3005,12 @@ install_tor() {
 
     local tor_arch_key
     case "$ARCH" in
-        x86_64) tor_arch_key="linux64" ;;
+        x86_64) tor_arch_key="linux-x86_64" ;;
         aarch64|arm64)
-            tor_arch_key="linux64"
-            warn "O Tor Project não oferece build nativa para ARM64 no canal estável — tentando a build linux64 (pode não ser compatível)."
+            tor_arch_key="linux-x86_64"
+            warn "O Tor Project não oferece build nativa para ARM64 no canal estável — tentando a build linux-x86_64 (pode não ser compatível)."
             ;;
-        i386|i686) tor_arch_key="linux32" ;;
+        i386|i686) tor_arch_key="linux-i686" ;;
         *)
             err "Arquitetura não suportada pelo Tor Browser: $ARCH"
             SUMMARY[tor]="Falhou (arquitetura não suportada)"
@@ -2286,7 +3018,7 @@ install_tor() {
             ;;
     esac
 
-    local install_dir="/opt/tor-browser"
+    local install_dir="$TOR_INSTALL_DIR"
 
     # ── Usa estado pré-computado pelo scan (ou re-detecta se chamado diretamente)
     local comp_s="${COMP_STATE[tor]:-}"
@@ -2295,7 +3027,15 @@ install_tor() {
         # Mapeia de volta para os valores brutos esperados pela lógica de instalação
         case "$comp_s" in
             ok)         state="ok"             ;;
-            broken)     state="binary_missing" ;;
+            broken)
+                # Distingue a instalação legada em /opt (causa raiz do bug de
+                # "já em execução") de um binário simplesmente ausente/corrompido.
+                if [[ "${COMP_DETAIL[tor]:-}" == *"/opt/tor-browser"* ]]; then
+                    state="legacy_system_install"
+                else
+                    state="binary_missing"
+                fi
+                ;;
             incomplete)
                 # Distingue desktop_missing de desktop_broken via detalhe
                 if [[ "${COMP_DETAIL[tor]:-}" == *"incorreta"* ]]; then
@@ -2322,9 +3062,24 @@ install_tor() {
         missing)
             : # continua para instalação
             ;;
+        legacy_system_install)
+            # Causa raiz do bug "já está em execução, mas não está
+            # respondendo": instalação antiga em /opt/tor-browser, root:root,
+            # somente leitura. O Firefox não consegue gravar o lock do
+            # próprio perfil nessas condições (ver comentário em
+            # TOR_INSTALL_DIR). Precisa ser removida (requer sudo, pois é
+            # root:root) e reinstalada no local correto, gravável pelo
+            # usuário.
+            warn "Detectada instalação antiga e incompatível em $_TOR_LEGACY_SYSTEM_DIR (root:root, somente leitura)."
+            warn "Essa é a causa raiz do erro \"já está em execução, mas não está respondendo\": o Firefox não consegue gravar o lock do próprio perfil nesse layout."
+            log "Removendo instalação antiga em $_TOR_LEGACY_SYSTEM_DIR e reinstalando em $install_dir (gravável pelo usuário)..."
+            sudo rm -rf "$_TOR_LEGACY_SYSTEM_DIR"
+            sudo rm -f "/usr/local/bin/tor-browser" "/usr/share/applications/tor-browser.desktop"
+            state="missing"
+            ;;
         binary_missing)
-            warn "Reinstalando Tor Browser (binário ausente/corrompido)..."
-            sudo rm -rf "$install_dir"
+            warn "Reinstalando Tor Browser (binário ausente/corrompido/sem permissão de escrita)..."
+            rm -rf "$install_dir" 2>/dev/null || sudo rm -rf "$install_dir"
             ;;
         desktop_missing)
             warn "Corrigindo apenas .desktop e launcher (sem reinstalar o navegador)..."
@@ -2352,14 +3107,10 @@ install_tor() {
         rm -rf "$HOME/.local/share/torbrowser"
     fi
 
-    # Pergunta apenas quando chamado via menu de ausentes (state = missing)
-    if [ "$state" = "missing" ]; then
-        if ! confirm "Instalar o Tor Browser?" "s"; then
-            ok "Tor Browser ignorado"
-            SUMMARY[tor]="Ignorado pelo usuário"
-            return
-        fi
-    fi
+    # Nenhuma confirmação adicional aqui: quando install_tor é chamado a partir
+    # do menu de "Ferramentas Opcionais" (_install_missing_optional), o usuário
+    # já escolheu explicitamente instalar o Tor Browser naquele menu — perguntar
+    # de novo "Deseja instalar?" era uma confirmação redundante.
 
     # ── Download ─────────────────────────────────────────────────────────────
     log "Detectando versão mais recente do Tor Browser (torproject.org)..."
@@ -2399,9 +3150,15 @@ install_tor() {
     fi
 
     # ── Extração e instalação ────────────────────────────────────────────────
-    log "Instalando em $install_dir ..."
-    sudo mkdir -p "$install_dir"
-    sudo tar -xJf "$archive" --strip-components=1 -C "$install_dir" \
+    # IMPORTANTE: instala dentro do HOME do usuário, SEM sudo. O Tor Browser é
+    # um "portable app" que precisa gravar dentro da própria árvore de
+    # instalação (perfil do Firefox, cache, o próprio .desktop interno, etc.)
+    # — ver o comentário completo em TOR_INSTALL_DIR. Instalar com sudo/root
+    # aqui reproduziria exatamente o bug original ("já está em execução, mas
+    # não está respondendo").
+    log "Instalando em $install_dir (diretório do usuário, sem privilégios elevados)..."
+    mkdir -p "$install_dir"
+    tar -xJf "$archive" --strip-components=1 -C "$install_dir" \
         || { err "Falha ao extrair o Tor Browser."; return 1; }
 
     # ── Permissões ───────────────────────────────────────────────────────────
@@ -2450,43 +3207,260 @@ install_tor() {
         ok "Launcher CLI presente: /usr/local/bin/tor-browser"
     fi
 
+    # ── Dono/grupo e permissões de todos os arquivos ─────────────────────────
+    # Não confia apenas na existência dos arquivos: confere que o dono/grupo e
+    # as permissões de leitura/execução estão corretos em toda a árvore.
+    if ! _tor_validate_ownership_permissions "$install_dir"; then
+        validation_ok=false
+    fi
+
+    # ── Validação real em runtime ─────────────────────────────────────────────
+    # A mera presença dos arquivos (start-tor-browser executável, firefox.real
+    # ELF válido, etc.) não prova que a instalação funciona de fato. Inicia o
+    # Tor Browser de verdade com --detach e confirma que um processo
+    # firefox.real correspondente sobe; sem isso, a instalação é considerada
+    # inválida mesmo que todos os arquivos estejam presentes.
+    local runtime_rc
+    _tor_validate_runtime "$install_dir"
+    runtime_rc=$?
+    if [ "$runtime_rc" -eq 1 ]; then
+        validation_ok=false
+    elif [ "$runtime_rc" -eq 2 ]; then
+        warn "Validação em runtime pulada (sem display gráfico disponível) — validação apenas estática."
+    fi
+
     if [ "$validation_ok" = true ]; then
-        ok "Tor Browser $tor_ver instalado e validado com sucesso"
+        if [ "$runtime_rc" -eq 0 ]; then
+            ok "Tor Browser $tor_ver instalado e validado com sucesso (arquivos + processo real confirmado)"
+        else
+            ok "Tor Browser $tor_ver instalado e validado (estático) — processo real não confirmado (sem display)"
+        fi
         ok "Para iniciar: tor-browser  ou via menu de aplicativos"
         SUMMARY[tor]="Instalado e validado ($tor_ver)"
     else
         warn "Tor Browser instalado ($tor_ver), mas com problemas na validação."
-        warn "Tente executar: /opt/tor-browser/Browser/start-tor-browser"
+        warn "Tente executar: $install_dir/Browser/start-tor-browser"
         SUMMARY[tor]="Instalado ($tor_ver) — validação parcial, veja o log"
     fi
 }
 
+# Confere dono/grupo e permissões de TODOS os arquivos em $install_dir.
+#
+# O Tor Browser é instalado dentro do HOME do usuário (ver TOR_INSTALL_DIR) e
+# precisa ser gravável por ELE — não por root. O dono/grupo esperado aqui é
+# sempre o usuário que está executando o script (id -un / id -gn), nunca
+# root: se o script for reexecutado após uma instalação legada em
+# /opt/tor-browser (root:root), a migração acima já remove e reinstala tudo
+# do zero como o usuário, então root:root nunca deveria aparecer aqui.
+# Registra cada arquivo problemático no log em vez de apenas relatar um total.
+_tor_validate_ownership_permissions() {
+    local install_dir="$1"
+    local expected_user; expected_user="$(id -un)"
+    local expected_group; expected_group="$(id -gn)"
+    local issues=0
+
+    log "Verificando dono/grupo de todos os arquivos em $install_dir (esperado: ${expected_user}:${expected_group})..."
+    local bad_owner
+    bad_owner=$(find "$install_dir" \( ! -user "$expected_user" -o ! -group "$expected_group" \) -printf '%u:%g  %p\n' 2>/dev/null)
+    if [ -n "$bad_owner" ]; then
+        warn "Arquivos com dono/grupo diferente de ${expected_user}:${expected_group}:"
+        while IFS= read -r line; do warn "  $line"; done <<< "$bad_owner"
+        issues=$((issues + 1))
+    else
+        ok "Todos os arquivos pertencem a ${expected_user}:${expected_group}"
+    fi
+
+    log "Verificando permissão de leitura de todos os arquivos em $install_dir..."
+    local unreadable
+    unreadable=$(find "$install_dir" ! -perm -a+r -printf '%m  %p\n' 2>/dev/null)
+    if [ -n "$unreadable" ]; then
+        warn "Arquivos sem permissão de leitura para todos:"
+        while IFS= read -r line; do warn "  $line"; done <<< "$unreadable"
+        issues=$((issues + 1))
+    else
+        ok "Permissões de leitura corretas em todos os arquivos"
+    fi
+
+    log "Verificando permissão de execução em diretórios (necessária para atravessá-los)..."
+    local bad_dirs
+    bad_dirs=$(find "$install_dir" -type d ! -perm -a+x -printf '%m  %p\n' 2>/dev/null)
+    if [ -n "$bad_dirs" ]; then
+        warn "Diretórios sem permissão de execução para todos:"
+        while IFS= read -r line; do warn "  $line"; done <<< "$bad_dirs"
+        issues=$((issues + 1))
+    else
+        ok "Permissões de execução corretas em todos os diretórios"
+    fi
+
+    log "Verificando permissão de execução dos binários/scripts críticos..."
+    local critical_paths=(
+        "$install_dir/Browser/start-tor-browser"
+        "$install_dir/Browser/firefox.real"
+        "$install_dir/start-tor-browser.desktop"
+    )
+    local bin
+    for bin in "${critical_paths[@]}"; do
+        if [ -e "$bin" ]; then
+            if [ -x "$bin" ]; then
+                ok "Executável: $bin"
+            else
+                warn "Sem permissão de execução: $bin ($(stat -c '%A %U:%G' "$bin" 2>/dev/null))"
+                issues=$((issues + 1))
+            fi
+        fi
+    done
+
+    [ "$issues" -eq 0 ]
+}
+
+# Validação real em runtime: inicia o Tor Browser de fato (start-tor-browser
+# --detach), aguarda alguns segundos e confirma via /proc que um processo
+# firefox.real correspondente ao binário instalado foi criado. Toda a saída
+# (stdout/stderr do launcher) é registrada no log.
+# Retorno: 0 = processo real confirmado; 1 = falhou em subir; 2 = pulado (sem display).
+_tor_validate_runtime() {
+    local install_dir="$1"
+    local launcher="$install_dir/Browser/start-tor-browser"
+    local firefox_real="$install_dir/Browser/firefox.real"
+    local runtime_log="$SETUP_TMP/tor-runtime-validation.log"
+
+    if [ ! -x "$launcher" ]; then
+        err "start-tor-browser ausente/não executável — validação em runtime não pode ser executada"
+        return 1
+    fi
+
+    # O próprio start-tor-browser oficial se recusa a rodar como root
+    # ("The Tor Browser should not be run as root. Exiting."). O instalador
+    # já roda a extração como o usuário comum (ver install_tor), então na
+    # imensa maioria dos casos já estamos rodando como o usuário correto. Só
+    # tentamos um fallback via sudo -u no caso raro deste script inteiro ter
+    # sido invocado com sudo.
+    local run_user="${SUDO_USER:-${USER:-}}"
+    local run_cmd=()
+    if [ "$(id -u)" -eq 0 ]; then
+        if [ -z "$run_user" ] || [ "$run_user" = "root" ]; then
+            warn "Não há um usuário não-root identificado para executar o Tor Browser — validação em runtime pulada."
+            return 2
+        fi
+        run_cmd=(sudo -u "$run_user" -H)
+    fi
+
+    # O Tor Browser exige um display gráfico. Usa o DISPLAY atual se existir;
+    # caso contrário, tenta um display virtual via xvfb-run para permitir a
+    # validação mesmo em ambientes headless.
+    local display_wrapper=()
+    if [ -z "${DISPLAY:-}" ] && [ -z "${WAYLAND_DISPLAY:-}" ]; then
+        if command -v xvfb-run >/dev/null 2>&1; then
+            log "Nenhum \$DISPLAY ativo — usando xvfb-run para validação headless do Tor Browser"
+            display_wrapper=(xvfb-run -a)
+        else
+            warn "Nenhum display gráfico ativo (\$DISPLAY/\$WAYLAND_DISPLAY) e 'xvfb-run' indisponível."
+            warn "Não é possível iniciar o processo real do Tor Browser para validação — apenas a validação estática de arquivos foi realizada."
+            return 2
+        fi
+    fi
+
+    # Usa a própria flag --log do start-tor-browser (com caminho ABSOLUTO)
+    # para capturar a saída real do Firefox. Por padrão (sem --verbose),
+    # start-tor-browser redireciona TODA a sua própria saída — e a do
+    # Firefox, que ele invoca internamente — para /dev/null; sem --log,
+    # qualquer erro real do Firefox (inclusive falhas de lock de perfil)
+    # ficaria invisível para esta validação, mesmo capturando o stdout do
+    # wrapper. --log e --detach não são mutuamente exclusivos (apenas
+    # --verbose e --detach são), então isso funciona em conjunto.
+    log "Iniciando Tor Browser real para validação: ${run_cmd[*]:-} ${display_wrapper[*]:-} $launcher --detach --log $runtime_log"
+    : > "$runtime_log"
+    "${run_cmd[@]}" "${display_wrapper[@]}" "$launcher" --detach --log "$runtime_log" &
+    local launcher_shell_pid=$!
+
+    local waited=0
+    local max_wait=25
+    local found_pid=""
+    while [ "$waited" -lt "$max_wait" ]; do
+        sleep 1
+        waited=$((waited + 1))
+        found_pid=$(pgrep -f "$firefox_real" 2>/dev/null | head -1)
+        [ -n "$found_pid" ] && break
+    done
+
+    # Registra TODA a saída do launcher no log principal, linha a linha.
+    log "Saída de start-tor-browser durante a validação em runtime:"
+    if [ -s "$runtime_log" ]; then
+        while IFS= read -r line; do
+            log "  [tor-runtime] $line"
+        done < "$runtime_log"
+    else
+        log "  [tor-runtime] (sem saída)"
+    fi
+
+    if [ -n "$found_pid" ]; then
+        ok "Processo firefox.real confirmado em execução (PID $found_pid, após ${waited}s) — instalação validada em runtime"
+        # Encerra o processo: isso é apenas uma validação, não deve permanecer aberto.
+        kill "$found_pid" 2>/dev/null || true
+        sleep 1
+        kill -0 "$found_pid" 2>/dev/null && kill -9 "$found_pid" 2>/dev/null || true
+        pkill -f "$install_dir/Browser/tor" 2>/dev/null || true
+        wait "$launcher_shell_pid" 2>/dev/null || true
+        return 0
+    else
+        err "Nenhum processo firefox.real foi encontrado após ${max_wait}s — instalação considerada INVÁLIDA em runtime, mesmo com os arquivos presentes"
+        kill "$launcher_shell_pid" 2>/dev/null || true
+        return 1
+    fi
+}
+
 # Corrige permissões do Tor Browser.
-# /opt/tor-browser deve ser legível por todos, mas o diretório de perfil
-# do usuário (~/.local/share/torbrowser) deve pertencer ao usuário.
+#
+# CAUSA RAIZ do bug "já está em execução, mas não está respondendo" (ver
+# comentário completo em TOR_INSTALL_DIR): o Tor Browser é um portable app
+# que precisa gravar dentro da PRÓPRIA árvore de instalação (perfil do
+# Firefox com seu lock, cache, o próprio .desktop interno, .config/ibus,
+# etc.) toda vez que é executado. A versão anterior deste script fazia
+# `chown root:root` + `chmod a+rX` (sem escrita para o usuário comum) em
+# /opt/tor-browser, o que impedia o Firefox de criar o lock do próprio
+# perfil; a falha ao obter esse lock é reportada pelo Firefox com a mesma
+# caixa de diálogo genérica de "já em execução", mesmo sem nenhum processo
+# ou lock realmente existir. Por isso o dono/grupo corretos aqui são sempre
+# os do usuário atual — nunca root — e as permissões preservam escrita.
 _tor_fix_permissions() {
-    local install_dir="/opt/tor-browser"
+    local install_dir="$TOR_INSTALL_DIR"
     if [ ! -d "$install_dir" ]; then return 0; fi
 
-    log "Corrigindo permissões de $install_dir ..."
-    sudo chown -R root:root "$install_dir"
-    sudo chmod -R a+rX "$install_dir"
+    log "Corrigindo permissões de $install_dir (dono: usuário atual, com escrita)..."
+    local uid_gid; uid_gid="$(id -u):$(id -g)"
+    # Sem sudo: o diretório já pertence ao usuário, pois foi extraído sem
+    # privilégios elevados em install_tor(). Usa sudo apenas como
+    # recuperação, caso alguma execução anterior (ex.: versão antiga deste
+    # script) tenha deixado arquivos root-owned para trás.
+    if ! chown -R "$uid_gid" "$install_dir" 2>/dev/null; then
+        sudo chown -R "$uid_gid" "$install_dir"
+    fi
+    # rwX para o dono (leitura/escrita em arquivos, atravessar diretórios;
+    # X maiúsculo só adiciona +x a diretórios e a arquivos que já eram
+    # executáveis, preservando os bits de execução originais do tarball).
+    # Sem escrita para grupo/outros: o Tor Browser não deveria ser
+    # compartilhado entre usuários (cada um deve ter sua própria cópia).
+    chmod -R u+rwX,go+rX,go-w "$install_dir" 2>/dev/null \
+        || sudo chmod -R u+rwX,go+rX,go-w "$install_dir"
 
     # O binário principal precisa ser executável
     if [ -f "$install_dir/Browser/start-tor-browser" ]; then
-        sudo chmod +x "$install_dir/Browser/start-tor-browser"
+        chmod +x "$install_dir/Browser/start-tor-browser" 2>/dev/null \
+            || sudo chmod +x "$install_dir/Browser/start-tor-browser"
     fi
     # Outros scripts .sh dentro de Browser/
     find "$install_dir/Browser" -maxdepth 1 -name "*.sh" -type f 2>/dev/null \
-        | xargs -I{} sudo chmod +x {} 2>/dev/null || true
+        | xargs -I{} chmod +x {} 2>/dev/null || true
 
-    # O diretório de perfil do usuário deve pertencer ao usuário (não root)
+    # O diretório de perfil legado do usuário (torbrowser-launcher de
+    # distribuições, não usado por este script, mas pode coexistir) deve
+    # pertencer ao usuário, não a root.
     local user_tor_dir="$HOME/.local/share/torbrowser"
     if [ -d "$user_tor_dir" ]; then
-        chown -R "$(id -u):$(id -g)" "$user_tor_dir" 2>/dev/null || true
+        chown -R "$uid_gid" "$user_tor_dir" 2>/dev/null || true
     fi
 
-    ok "Permissões corrigidas"
+    ok "Permissões corrigidas (dono: $(id -un):$(id -gn), gravável pelo usuário)"
 }
 
 # show_tools_menu foi substituído por _install_missing_optional (definida acima).
